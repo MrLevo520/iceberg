@@ -24,6 +24,11 @@ import org.apache.iceberg.ManifestFile;
 import org.apache.iceberg.relocated.com.google.common.base.Preconditions;
 import org.apache.iceberg.relocated.com.google.common.collect.Lists;
 
+/**
+ * 囊括了dataManifest和deleteManifest
+ * 主要结构就是manifest的一个封装
+ *
+ * */
 class DeltaManifests {
 
   private static final CharSequence[] EMPTY_REF_DATA_FILES = new CharSequence[0];

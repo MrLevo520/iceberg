@@ -28,6 +28,9 @@ import org.apache.iceberg.relocated.com.google.common.collect.Iterables;
 import org.apache.iceberg.relocated.com.google.common.collect.Lists;
 import org.apache.iceberg.util.CharSequenceSet;
 
+/**
+ * 实际存储了metadata中.avro的文件内容，包含了实际存储数据中的一些统计信息，包括分区统计等
+ * */
 public class WriteResult implements Serializable {
   private DataFile[] dataFiles;
   private DeleteFile[] deleteFiles;

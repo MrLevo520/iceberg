@@ -85,10 +85,15 @@ class IcebergFilesCommitter extends AbstractStreamOperator<Void>
   // <2, <file3>>. Snapshot for checkpoint#1 interrupted because of network/disk failure etc, while we don't expect
   // any data loss in iceberg table. So we keep the finished files <1, <file0, file1>> in memory and retry to commit
   // iceberg table when the next checkpoint happen.
+
+  // 使用treemap作为存储是为了利用其有序性，因为可能存在ck时写sn失败的情况，这样summary中就不会有MAX_COMMITTED_CHECKPOINT_ID的更新
+  // 等待下一次cp的时候，再把cp之间差值的增量同步更新上去，把max刷到最新；如果flink cp失败重试，那也不会重复写入，因为需要判断是否大于目前元数据中的max
+  // 其中存储的key是cpid，value是序列化后二进制的data数据
   private final NavigableMap<Long, byte[]> dataFilesPerCheckpoint = Maps.newTreeMap();
 
   // The completed files cache for current checkpoint. Once the snapshot barrier received, it will be flushed to the
   // 'dataFilesPerCheckpoint'.
+  // 存储当前cpid对应结果的缓存，一旦对齐完成，将会把数据写入dataFilesPerCheckpoint中
   private final List<WriteResult> writeResultsOfCurrentCkpt = Lists.newArrayList();
 
   // It will have an unique identifier for one job.
@@ -96,12 +101,17 @@ class IcebergFilesCommitter extends AbstractStreamOperator<Void>
   private transient Table table;
   private transient ManifestOutputFileFactory manifestOutputFileFactory;
   private transient long maxCommittedCheckpointId;
+  // 对连续cp时候totalFiles为0的数据进行记录+1
   private transient int continuousEmptyCheckpoints;
+  // 允许最大的continuousEmptyCheckpoints次数，即达到该次数后，都要提交一次进行快照
+  // 本质上是为了减少无效快照的生成 e.g 如只是max是10，那么即使连续9次都是empty，iceberg的sn也不会增加
   private transient int maxContinuousEmptyCommits;
   // There're two cases that we restore from flink checkpoints: the first case is restoring from snapshot created by the
   // same flink job; another case is restoring from snapshot created by another different job. For the second case, we
   // need to maintain the old flink job's id in flink state backend to find the max-committed-checkpoint-id when
   // traversing iceberg table's snapshots.
+
+  // 两种方式进行从cp恢复； 一种是从原先的flink任务中恢复，另一种是从新的flink任务中重启，此时jobid是新的；所以需要获取到以前任务jobid下的最大消费的cpid
   private static final ListStateDescriptor<String> JOB_ID_DESCRIPTOR = new ListStateDescriptor<>(
       "iceberg-flink-job-id", BasicTypeInfo.STRING_TYPE_INFO);
   private transient ListState<String> jobIdState;
@@ -114,27 +124,41 @@ class IcebergFilesCommitter extends AbstractStreamOperator<Void>
     this.replacePartitions = replacePartitions;
   }
 
+  /**
+   * 一些初始化操作，主要是获取调用该committer的flink相关的信息，
+   * 若有数据需要恢复消费情况，则需要将未提交的数据进行提交，注意，这里只提交一次，快照只有一次，但可能提交了多个cp的数据
+   * 取决于数据落后的情况
+   *
+   * */
   @Override
   public void initializeState(StateInitializationContext context) throws Exception {
     super.initializeState(context);
     this.flinkJobId = getContainingTask().getEnvironment().getJobID().toString();
 
     // Open the table loader and load the table.
+    // 加载catalog数据，有hivecatalog和hadoopcatalog，还有自定义的
     this.tableLoader.open();
+    // 加载iceberg表
     this.table = tableLoader.loadTable();
 
+    // 设置flink连续提交empty何时触发sn
     maxContinuousEmptyCommits = PropertyUtil.propertyAsInt(table.properties(), MAX_CONTINUOUS_EMPTY_COMMITS, 10);
     Preconditions.checkArgument(maxContinuousEmptyCommits > 0,
         MAX_CONTINUOUS_EMPTY_COMMITS + " must be positive");
 
+    // 类似于spark，创建tmp目录，然后最后提交再把tmp目录中的数据移到正式目录并删除临时目录文件夹
     int subTaskId = getRuntimeContext().getIndexOfThisSubtask();
     int attemptId = getRuntimeContext().getAttemptNumber();
     this.manifestOutputFileFactory = FlinkManifestUtil.createOutputFileFactory(table, flinkJobId, subTaskId, attemptId);
     this.maxCommittedCheckpointId = INITIAL_CHECKPOINT_ID;
 
+    // cp状态存储，jobid状态存储(考虑到可能换任务用新jobid)
     this.checkpointsState = context.getOperatorStateStore().getListState(STATE_DESCRIPTOR);
     this.jobIdState = context.getOperatorStateStore().getListState(JOB_ID_DESCRIPTOR);
+
+    // 如果任务是有状态的(有中间计算结果)，那么需要搞定状态恢复的问题
     if (context.isRestored()) {
+      // 轮询获取jobid
       String restoredFlinkJobId = jobIdState.get().iterator().next();
       Preconditions.checkState(!Strings.isNullOrEmpty(restoredFlinkJobId),
           "Flink job id parsed from checkpoint snapshot shouldn't be null or empty");
@@ -142,23 +166,36 @@ class IcebergFilesCommitter extends AbstractStreamOperator<Void>
       // Since flink's checkpoint id will start from the max-committed-checkpoint-id + 1 in the new flink job even if
       // it's restored from a snapshot created by another different flink job, so it's safe to assign the max committed
       // checkpoint id from restored flink job to the current flink job.
+      // 从有状态的一个flink任务恢复到另一个flink任务(jobid不一样), 需要先获取以前那个flink任务下最大的cpid
+      // 因为iceberg会根据cpid进行判断，只有大于cpid的才会进行snapshot
       this.maxCommittedCheckpointId = getMaxCommittedCheckpointId(table, restoredFlinkJobId);
 
+      // 恢复时拿到不小于maxCommittedCheckpointId值的一系列数据 e.g <cp1, <data1,data2>>, <cp2, <data3>>
+      // 还未提交的片段(flink cp作为iceberg sn，cp之间的一段即为片段)
       NavigableMap<Long, byte[]> uncommittedDataFiles = Maps
           .newTreeMap(checkpointsState.get().iterator().next())
           .tailMap(maxCommittedCheckpointId, false);
+      // 如果有未提交的片段，那么初始化时候先提交一波
       if (!uncommittedDataFiles.isEmpty()) {
         // Committed all uncommitted data files from the old flink job to iceberg table.
+        // 拿到最大的未提交的cpid当做记录在summary中的flink.max-committed-checkpoint-id
+        // 因为可能存在很多未提交的数据，有很多cpid及对应的数据，
+        // 在初始化过程中对于未提交的数据进行恢复时，将通过一次快照把这些数据都写到iceberg中
         long maxUncommittedCheckpointId = uncommittedDataFiles.lastKey();
         commitUpToCheckpoint(uncommittedDataFiles, restoredFlinkJobId, maxUncommittedCheckpointId);
       }
     }
   }
 
+  /**
+   *  将iceberg快照的状态写入状态后端
+   *
+   * */
   @Override
   public void snapshotState(StateSnapshotContext context) throws Exception {
     super.snapshotState(context);
     long checkpointId = context.getCheckpointId();
+
     LOG.info("Start to flush snapshot state to state backend, table: {}, checkpointId: {}", table, checkpointId);
 
     // Update the checkpoint state.
@@ -174,8 +211,14 @@ class IcebergFilesCommitter extends AbstractStreamOperator<Void>
     writeResultsOfCurrentCkpt.clear();
   }
 
+  /**
+   * 核心
+   * checkpoint完成并提交时候调用，相当于flink做cp时候，iceberg做sn
+   *
+   * */
   @Override
   public void notifyCheckpointComplete(long checkpointId) throws Exception {
+    // 将cpid写到状态后端
     super.notifyCheckpointComplete(checkpointId);
     // It's possible that we have the following events:
     //   1. snapshotState(ckpId);
@@ -184,17 +227,30 @@ class IcebergFilesCommitter extends AbstractStreamOperator<Void>
     //   4. notifyCheckpointComplete(ckpId);
     // For step#4, we don't need to commit iceberg table again because in step#3 we've committed all the files,
     // Besides, we need to maintain the max-committed-checkpoint-id to be increasing.
+
+    // 如果发现新的cpid > summary中存储的cpid，则进行提交，否则不提交，这样就保证了提交不重复
     if (checkpointId > maxCommittedCheckpointId) {
       commitUpToCheckpoint(dataFilesPerCheckpoint, flinkJobId, checkpointId);
       this.maxCommittedCheckpointId = checkpointId;
     }
   }
 
+  /**
+   * 提交部分核心方法
+   * 由checkpoint触发的commit提交
+   *
+   * 1. 组装需要提交的元数据
+   * 3. 根据是否覆盖分区进行不同方式提交，本质上最终调用commitOperation
+   * 4. 删除flink manifest存放的临时路径
+   *
+   */
   private void commitUpToCheckpoint(NavigableMap<Long, byte[]> deltaManifestsMap,
                                     String newFlinkJobId,
                                     long checkpointId) throws IOException {
     NavigableMap<Long, byte[]> pendingMap = deltaManifestsMap.headMap(checkpointId, true);
+    // manifests其实本质上就是snap-id代表的文件里的内容,内容是n个ManifestFile对象构成的
     List<ManifestFile> manifests = Lists.newArrayList();
+    // WriteResult实际存储了metadata中.avro的文件内容，包含了实际存储数据中的一些统计信息，包括分区统计等
     NavigableMap<Long, WriteResult> pendingResults = Maps.newTreeMap();
     for (Map.Entry<Long, byte[]> e : pendingMap.entrySet()) {
       if (Arrays.equals(EMPTY_MANIFEST_DATA, e.getValue())) {
@@ -204,17 +260,23 @@ class IcebergFilesCommitter extends AbstractStreamOperator<Void>
 
       DeltaManifests deltaManifests = SimpleVersionedSerialization
           .readVersionAndDeSerialize(DeltaManifestsSerializer.INSTANCE, e.getValue());
+      // 存储该cpid下，存储数据相关的一些信息，
       pendingResults.put(e.getKey(), FlinkManifestUtil.readCompletedFiles(deltaManifests, table.io()));
       manifests.addAll(deltaManifests.manifests());
     }
 
+    // 开始提交
     int totalFiles = pendingResults.values().stream()
         .mapToInt(r -> r.dataFiles().length + r.deleteFiles().length).sum();
     continuousEmptyCheckpoints = totalFiles == 0 ? continuousEmptyCheckpoints + 1 : 0;
+    // 提交的条件： 符合非空 或者 达到连续空积累到最大连续空提交条件。
+    // 即被整除，如连续空为9次，但最大连续空commit限定是10，则仍然不提交
     if (totalFiles != 0 || continuousEmptyCheckpoints % maxContinuousEmptyCommits == 0) {
       if (replacePartitions) {
+        // 先删除分区，然后再提交，所谓覆盖
         replacePartitions(pendingResults, newFlinkJobId, checkpointId);
       } else {
+        // 一般方式提交
         commitDeltaTxn(pendingResults, newFlinkJobId, checkpointId);
       }
       continuousEmptyCheckpoints = 0;
@@ -222,6 +284,7 @@ class IcebergFilesCommitter extends AbstractStreamOperator<Void>
     pendingMap.clear();
 
     // Delete the committed manifests.
+    // 将临时的flink manifest文件删除
     for (ManifestFile manifest : manifests) {
       try {
         table.io().deleteFile(manifest.path());
@@ -258,11 +321,13 @@ class IcebergFilesCommitter extends AbstractStreamOperator<Void>
     commitOperation(dynamicOverwrite, numFiles, 0, "dynamic partition overwrite", newFlinkJobId, checkpointId);
   }
 
+  // 提交元数据
   private void commitDeltaTxn(NavigableMap<Long, WriteResult> pendingResults, String newFlinkJobId, long checkpointId) {
     int deleteFilesNum = pendingResults.values().stream().mapToInt(r -> r.deleteFiles().length).sum();
 
     if (deleteFilesNum == 0) {
       // To be compatible with iceberg format V1.
+      // 一系列datafile结构的数据
       AppendFiles appendFiles = table.newAppend();
 
       int numFiles = 0;
@@ -272,7 +337,7 @@ class IcebergFilesCommitter extends AbstractStreamOperator<Void>
         numFiles += result.dataFiles().length;
         Arrays.stream(result.dataFiles()).forEach(appendFiles::appendFile);
       }
-
+      // 提交文件内容
       commitOperation(appendFiles, numFiles, 0, "append", newFlinkJobId, checkpointId);
     } else {
       // To be compatible with iceberg format V2.
@@ -301,10 +366,15 @@ class IcebergFilesCommitter extends AbstractStreamOperator<Void>
     }
   }
 
+  /**
+   * 核心
+   * 提交元数据操作
+   * */
   private void commitOperation(SnapshotUpdate<?> operation, int numDataFiles, int numDeleteFiles, String description,
                                String newFlinkJobId, long checkpointId) {
     LOG.info("Committing {} with {} data files and {} delete files to table {}", description, numDataFiles,
         numDeleteFiles, table);
+    // 将 flink.max-committed-checkpoint-id，flink.job-id 写入 summary
     operation.set(MAX_COMMITTED_CHECKPOINT_ID, Long.toString(checkpointId));
     operation.set(FLINK_JOB_ID, newFlinkJobId);
 
@@ -314,11 +384,19 @@ class IcebergFilesCommitter extends AbstractStreamOperator<Void>
     LOG.info("Committed in {} ms", duration);
   }
 
+  /**
+   * todo 不断向缓存中写对应的数据，如cp1已过，而未到cp2期间，就会把数据缓存起来？
+   * */
   @Override
   public void processElement(StreamRecord<WriteResult> element) {
     this.writeResultsOfCurrentCkpt.add(element.getValue());
   }
 
+  /**
+   * 后续没有数据再会到达时处理
+   * summary中flink.max-committed-checkpoint-id直接拉到顶
+   *
+   */
   @Override
   public void endInput() throws IOException {
     // Flush the buffered data files into 'dataFilesPerCheckpoint' firstly.

@@ -97,10 +97,14 @@ class FlinkManifestUtil {
     return new DeltaManifests(dataManifest, deleteManifest, result.referencedDataFiles());
   }
 
+  /**
+   * 构造一系列将要写入的数据结构主要是一些manifest结构的数据
+   * */
   static WriteResult readCompletedFiles(DeltaManifests deltaManifests, FileIO io) throws IOException {
     WriteResult.Builder builder = WriteResult.builder();
 
     // Read the completed data files from persisted data manifest file.
+    // 构造包含data实际路径和统计信息的数据到writerResult中
     if (deltaManifests.dataManifest() != null) {
       builder.addDataFiles(readDataFiles(deltaManifests.dataManifest(), io));
     }

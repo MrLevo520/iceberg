@@ -28,6 +28,8 @@ import static org.apache.iceberg.types.Types.NestedField.required;
 
 /**
  * Represents a manifest file that can be scanned to find data files in a table.
+ *
+ * 对应的是metadata下snap-id的avro格式的文件，里面包含了一系列的ManifestFile对象，是manifest-list的存储单元
  */
 public interface ManifestFile {
   Types.NestedField PATH = required(500, "manifest_path", Types.StringType.get(), "Location URI with FS scheme");

@@ -21,6 +21,7 @@ package org.apache.iceberg;
 
 import java.io.IOException;
 import java.util.Arrays;
+import java.util.HashMap;
 import java.util.List;
 import java.util.Map;
 import org.apache.iceberg.exceptions.RuntimeIOException;
@@ -123,7 +124,13 @@ class BaseSnapshot implements Snapshot {
 
   @Override
   public Map<String, String> summary() {
-    return summary;
+    // 测试增加一个新字段
+    Map<String, String> summary2 = new HashMap<>();
+    summary.forEach(summary2::put);
+    summary2.put("your-own-feature", "kyleKaiXu");
+    System.out.println("change source code here");
+    System.out.println(summary2.get("flink.job-id"));
+    return summary2;
   }
 
   @Override

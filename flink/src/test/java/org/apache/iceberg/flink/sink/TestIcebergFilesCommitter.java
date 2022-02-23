@@ -157,7 +157,9 @@ public class TestIcebergFilesCommitter extends TableTestBase {
       assertSnapshotSize(0);
 
       for (int i = 1; i <= 9; i++) {
+        // flink先做cp
         harness.snapshot(++checkpointId, ++timestamp);
+        // 通知cp已完成
         harness.notifyOfCompletedCheckpoint(checkpointId);
 
         assertSnapshotSize(i / 3);
